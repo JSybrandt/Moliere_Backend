@@ -1,0 +1,217 @@
+AWS BATCH DOCUMENTATION FOR MOLIERE
+DECEMBER 11, 2017
+
+================================================================================
+The process of running the MOLIERE process is automated.  A job that is
+submitted through the console or web interface will require the custom AMI.
+
+This provides the information required to run the MOLIERE process and installs
+the required packages.
+
+These are the commands to push to the ECS repository if changes need to be
+made to the Dockerfile:
+
+sudo $(aws ecr get-login --region us-east-1)
+sudo docker build -t compute .
+sudo docker tag compute:latest 500992819193.dkr.ecr.us-east-1.amazonaws.com/compute:latest
+sudo docker push 500992819193.dkr.ecr.us-east-1.amazonaws.com/compute:latest
+
+The dockerfile installs the necessary packages for running MOLIERE.
+
+Dockerfile:
+
+FROM ubuntu:latest
+RUN apt-get update
+RUN apt-get install nfs-common -y
+RUN apt-get install python-pip -y
+RUN apt-get install unzip -y
+RUN apt-get install sqlite -y
+RUN apt-get install openmpi-bin -y
+RUN apt-get install python3 -y
+RUN apt-get install mpich -y
+RUN pip install awscli
+RUN mkdir /efs
+ADD fetch_and_run.sh /usr/local/bin/fetch_and_run.sh
+WORKDIR /tmp
+USER nobody
+ENTRYPOINT ["/usr/local/bin/fetch_and_run.sh"]
+
+The fetch_and_run.sh script will run immediately afterwards.
+
+fetch_and_run.sh:
+
+#!/bin/bash
+
+# Copyright 2013-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance with the
+# License. A copy of the License is located at
+#
+# http://aws.amazon.com/apache2.0/
+#
+# or in the "LICENSE.txt" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
+# OR CONDITIONS OF ANY KIND, express or implied. See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This script can help you download and run a script from S3 using aws-cli.
+# It can also download a zip file from S3 and run a script from inside.
+# See below for usage instructions.
+
+PATH="/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin:/usr/local/sbin"
+BASENAME="${0##*/}"
+
+usage () {
+  if [ "${#@}" -ne 0 ]; then
+    echo "* ${*}"
+    echo
+  fi
+  cat <<ENDUSAGE
+Usage:
+
+export BATCH_FILE_TYPE="script"
+export BATCH_FILE_S3_URL="s3://my-bucket/my-script"
+${BASENAME} script-from-s3 [ <script arguments> ]
+
+  - or -
+
+export BATCH_FILE_TYPE="zip"
+export BATCH_FILE_S3_URL="s3://my-bucket/my-zip"
+${BASENAME} script-from-zip [ <script arguments> ]
+ENDUSAGE
+
+  exit 2
+}
+
+# Standard function to print an error and exit with a failing return code
+error_exit () {
+  echo "${BASENAME} - ${1}" >&2
+  exit 1
+}
+
+# Check what environment variables are set
+if [ -z "${BATCH_FILE_TYPE}" ]; then
+  usage "BATCH_FILE_TYPE not set, unable to determine type (zip/script) of URL ${BATCH_FILE_S3_URL}"
+fi
+
+if [ -z "${BATCH_FILE_S3_URL}" ]; then
+  usage "BATCH_FILE_S3_URL not set. No object to download."
+fi
+
+scheme="$(echo "${BATCH_FILE_S3_URL}" | cut -d: -f1)"
+if [ "${scheme}" != "s3" ]; then
+  usage "BATCH_FILE_S3_URL must be for an S3 object; expecting URL starting with s3://"
+fi
+
+# Check that necessary programs are available
+which aws >/dev/null 2>&1 || error_exit "Unable to find AWS CLI executable."
+which unzip >/dev/null 2>&1 || error_exit "Unable to find unzip executable."
+
+# Create a temporary directory to hold the downloaded contents, and make sure
+# it's removed later, unless the user set KEEP_BATCH_FILE_CONTENTS.
+cleanup () {
+   if [ -z "${KEEP_BATCH_FILE_CONTENTS}" ] \
+     && [ -n "${TMPDIR}" ] \
+     && [ "${TMPDIR}" != "/" ]; then
+      rm -r "${TMPDIR}"
+   fi
+}
+trap 'cleanup' EXIT HUP INT QUIT TERM
+# mktemp arguments are not very portable.  We make a temporary directory with
+# portable arguments, then use a consistent filename within.
+TMPDIR="$(mktemp -d -t tmp.XXXXXXXXX)" || error_exit "Failed to create temp directory."
+TMPFILE="${TMPDIR}/batch-file-temp"
+install -m 0600 /dev/null "${TMPFILE}" || error_exit "Failed to create temp file."
+
+# Fetch and run a script
+fetch_and_run_script () {
+  # Create a temporary file and download the script
+  aws s3 cp "${BATCH_FILE_S3_URL}" - > "${TMPFILE}" || error_exit "Failed to download S3 script."
+
+  # Make the temporary file executable and run it with any given arguments
+  local script="./${1}"; shift
+  chmod u+x "${TMPFILE}" || error_exit "Failed to chmod script."
+  exec ${TMPFILE} "${@}" || error_exit "Failed to execute script."
+}
+
+# Download a zip and run a specified script from inside
+fetch_and_run_zip () {
+  # Create a temporary file and download the zip file
+  aws s3 cp "${BATCH_FILE_S3_URL}" - > "${TMPFILE}" || error_exit "Failed to download S3 zip file from ${BATCH_FILE_S3_URL}"
+
+  # Create a temporary directory and unpack the zip file
+  cd "${TMPDIR}" || error_exit "Unable to cd to temporary directory."
+  unzip -q "${TMPFILE}" || error_exit "Failed to unpack zip file."
+
+  # Use first argument as script name and pass the rest to the script
+  local script="./${1}"; shift
+  [ -r "${script}" ] || error_exit "Did not find specified script '${script}' in zip from ${BATCH_FILE_S3_URL}"
+  chmod u+x "${script}" || error_exit "Failed to chmod script."
+  exec "${script}" "${@}" || error_exit " Failed to execute script."
+}
+
+# Main - dispatch user request to appropriate function
+case ${BATCH_FILE_TYPE} in
+  zip)
+    if [ ${#@} -eq 0 ]; then
+      usage "zip format requires at least one argument - the script to run from inside"
+    fi
+    fetch_and_run_zip "${@}"
+    ;;
+
+  script)
+    fetch_and_run_script "${@}"
+    ;;
+
+  *)
+    usage "Unsupported value for BATCH_FILE_TYPE. Expected (zip/script)."
+    ;;
+esac
+
+
+The fetch_and_run.sh script will load the script from s3 that is saved in
+s3://script-moliere/myscript.sh and run it.  This script contains the necessary
+information to mount the EFS volume and run the MOLIERE compute process.
+
+In order to be able to mount the EFS volume, the user needs to be root when
+running the batch job.  This is specified in the job definition in AWS Batch.
+
+EC2 instances launched by Batch MUST be in the same VPC as the EFS drive so
+they can mount and read/write to the drive.
+
+Job Submission
+--------------
+
+To submit a job through AWS Batch, navigate to the AWS Batch->Jobs tab.
+
+	-Select "Submit Job"
+	-Enter a Job name (No spaces)
+	-Select the compute:18 job definition (latest)
+	-Select the "queue" job queue
+	-Add two environment variables in addition to the ones already there
+		-SOURCE_WORD : word_to_run_job_on
+		-TARGET_WORD : word_to_run_job_on
+	-Click "Submit Job"
+
+***IMPORTANT: Words submitted in SOURCE_WORD or TARGET_WORD cannot include
+spaces.  Either submit one word or a phrase_with_underscores ***
+
+The Job Queue has several different statuses for a job:
+
+	-Submitted, Starting indicate the job was just submitted.
+	-Runnable means that the job passed preliminary tests and can run.
+	Jobs may stay in this state indefinitely if the user is not allowed
+	to run the selected instance.  Jobs will also stay in the Runnable 
+	state if there are already the maximum number of jobs running.  They
+	will move to running if there is availiable space.
+	-Running indicates that the job is currently running.
+	-Failed indicates there was an error.  More information can be found by
+	selecting the job and clicking on the logs.
+	-Succeeded means that the job has successfully run all the way through.
+
+Currently, the limit for running r4.16xlarge instances is 2 running at once.
+This number can be increased by contacting AWS Support.
+
+Due to time constraints, results from the job are always saved in s3 as 
+"Compute_Results/results.txt"  This should be changed in the future to a job
+name.  Also, the JSON formatted data and normal formats should both be saved
+in s3.
